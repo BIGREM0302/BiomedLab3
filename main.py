@@ -28,13 +28,13 @@ class Config:
     DATASET_PATH = "bci_dataset_114-2"
     
     # MLP model parameters
-    HIDDEN_LAYERS = (64,32)
+    HIDDEN_LAYERS = (32,)
     MAX_ITER = 1000
-    LEARNING_RATE = 0.001
-    ALPHA = 0.0005
+    LEARNING_RATE = 0.01
+    ALPHA = 0.01
     ACTIVATION = 'relu'
     SOLVER = 'adam'
-    BATCH_SIZE = 64
+    BATCH_SIZE = 128
     EARLY_STOPPING = True
     VALIDATION_FRACTION = 0.1
     N_ITER_NO_CHANGE = 10
@@ -54,12 +54,12 @@ class Config:
 # ==========================================
 # Preprocessing 
 # ==========================================
-def bandpass_filter(data, fs, low=1, high=45):  ### [MODIFIED]
+def bandpass_filter(data, fs, low=0.1, high=45):  ### [MODIFIED]
     b, a = signal.butter(4, [low/(fs/2), high/(fs/2)], btype='band')
     return signal.filtfilt(b, a, data)
 
 
-def notch_filter(data, fs, freq=50):  ### [MODIFIED]
+def notch_filter(data, fs, freq=60):  ### [MODIFIED]
     b, a = signal.iirnotch(freq/(fs/2), Q=30)
     return signal.filtfilt(b, a, data)
 # =========================================
@@ -97,17 +97,20 @@ def bandpower(seg, fs, band):  ### [MODIFIED]
 
 def extract_features(segments):
     features = []
-    bands = {
-        'Delta': (1, 4), 'Theta': (4, 8), 'Alpha': (8, 13), 'Beta': (13, 30), 'Gamma': (30, 50)
-    }
+    bands = {'Delta': (1, 4), 'Theta': (4, 8), 'Alpha': (8, 13), 'Beta': (13, 30), 'Gamma': (30, 50)}
 
     for seg in segments:
         feat = []
 
-        # 1. 逐段標準化 (Per-segment Z-score)
+        # === 💥 1. 暴力物理特徵 (不標準化，專門對付 Blink) === ### [MODIFIED]
+        # 直接拿濾波後、最原始的電壓來算，眨眼的數字會是其他狀態的十幾倍
+        raw_ptp = np.max(seg) - np.min(seg)
+        raw_var = np.var(seg)
+        
+        # === 2. 逐段標準化 (為了算頻率能量，讓 Relax/Focus 站在同一起跑線) ===
         seg_norm = (seg - np.mean(seg)) / (np.std(seg) + 1e-8)
 
-        # 2. 相對頻段能量 (使用標準化後的波形)
+        # 3. 相對頻段能量 (使用標準化後的波形)
         abs_powers = []
         for b in bands.values():
             bp = bandpower(seg_norm, Config.SAMPLING_RATE, b)
@@ -115,17 +118,16 @@ def extract_features(segments):
         
         total_power = sum(abs_powers) + 1e-8
         for bp in abs_powers:
-            feat.append(bp / total_power)  # 加入 5 個相對能量
+            feat.append(bp / total_power)  
 
-        # 3. 神經科學黃金指標
-        feat.append(abs_powers[2] / (abs_powers[3] + 1e-8)) # ABR (Alpha/Beta Ratio)
-        feat.append(abs_powers[1] / (abs_powers[3] + 1e-8)) # TBR (Theta/Beta Ratio)
+        # 4. 神經科學黃金指標
+        feat.append(abs_powers[2] / (abs_powers[3] + 1e-8)) # Alpha/Beta
+        feat.append(abs_powers[1] / (abs_powers[3] + 1e-8)) # Theta/Beta
 
-        # === 💥 4. 針對眨眼 (Blink) 的跨受測者強效特徵 === ### [MODIFIED]
-        # 放棄絕對電壓，改看 Z-score 後的「相對峰對峰值」與「波形尖銳度」
-        feat.append(np.max(seg_norm) - np.min(seg_norm)) # Z-score PTP (眨眼通常會異常飆高)
-        feat.append(stats.kurtosis(seg_norm))           # 峰度 Kurtosis (抓取眨眼的尖銳突波)
-        feat.append(np.log(np.var(seg) + 1e-8))          # 取 Log 的變異數 (壓縮個體極端差異)
+        # 5. 組裝特徵 
+        feat.append(raw_ptp)                  # ### [MODIFIED] 塞入原始峰對峰值
+        feat.append(np.log(raw_var + 1e-8))   # ### [MODIFIED] 塞入原始變異數的 Log
+        feat.append(stats.kurtosis(seg))      # 峰度 (尖銳度)
 
         features.append(feat)
 
