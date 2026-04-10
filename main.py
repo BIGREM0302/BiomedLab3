@@ -1,9 +1,8 @@
 """
 Brain-Computer Interface MLP Classifier (BrainLink Version)
 For EEG signal relaxation/focus/blink state classification
-USE RAW DATA AS INPUT
+WITH FEATURE ENGINEERING & PREPROCESSING (Compliant with README)
 """
-#hi hi
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -12,6 +11,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, confusion_matrix
 from sklearn.neural_network import MLPClassifier
 from sklearn.feature_selection import SelectKBest, f_classif
+from scipy import signal
 import os
 import glob
 import warnings
@@ -24,24 +24,24 @@ class Config:
     
     # MLP model parameters
     HIDDEN_LAYERS = (128, 64, 32)
-    MAX_ITER = 100
-    LEARNING_RATE = 0.001
-    ALPHA = 0.001
-    ACTIVATION = 'relu'
-    SOLVER = 'adam'
-    BATCH_SIZE = 64
-    EARLY_STOPPING = True
+    MAX_ITER = 200             # [Allowed] 50 ~ 200
+    LEARNING_RATE = 0.01       # [Allowed] 0.005 ~ 0.02
+    ALPHA = 0.01               # [Allowed] 0.0001 ~ 0.05
+    ACTIVATION = 'relu'        # [Fixed]
+    SOLVER = 'adam'            # [Fixed]
+    BATCH_SIZE = 64            # [Allowed] 32 ~ 128
+    EARLY_STOPPING = True      # [Fixed]
     VALIDATION_FRACTION = 0.1
     N_ITER_NO_CHANGE = 10
     
     # Signal processing parameters
-    SAMPLING_RATE = 512    # BrainLink fixed sampling rate
-    SEGMENT_LENGTH = 5     # Segment length in seconds
-    OVERLAP_RATIO = 0.6    # Overlap ratio for segments
+    SAMPLING_RATE = 512        # [Fixed] BrainLink fixed sampling rate
+    SEGMENT_LENGTH = 4         # [Allowed] 2 ~ 6 秒
+    OVERLAP_RATIO = 0.5        # [Allowed] 0.0 ~ 0.8
     
     # Feature selection parameters
     FEATURE_SELECTION = True
-    N_FEATURES_SELECT = 30 # Modify preprocessing to extract truly effective features
+    N_FEATURES_SELECT = 10     # 配合我們提取的特徵數量
     
     # Other settings
     RANDOM_STATE = 42
@@ -55,14 +55,25 @@ def create_segments(data, segment_length_samples, overlap_samples):
     start = 0
     step = segment_length_samples - overlap_samples
     
+    # === student preprocessing ===
+    # 建立 1-40 Hz Butterworth Bandpass Filter
+    nyq = 0.5 * Config.SAMPLING_RATE
+    low = 1.0 / nyq
+    high = 40.0 / nyq
+    b, a = signal.butter(4, [low, high], btype='band')
+    
     while start + segment_length_samples <= len(data):
         segment = data[start:start + segment_length_samples]
         
-        # ==========================================
-        # === STUDENT PREPROCESSING HERE (Part 1)===
-        # ==========================================
- 
-        segments.append(segment)
+        # 1. 濾除極低頻基線漂移與高頻雜訊
+        segment_filtered = signal.filtfilt(b, a, segment)
+        
+        # 2. Artifact Rejection (剔除極端雜訊)
+        if np.max(np.abs(segment_filtered)) > 800:
+            start += step
+            continue
+            
+        segments.append(segment_filtered)
         start += step
     
     return segments
@@ -73,17 +84,36 @@ def extract_features(segments):
     """
     features = []
     for seg in segments:
-        # ==========================================
-        # === STUDENT PREPROCESSING HERE (Part 2)===
-        # ==========================================
+        # === student preprocessing ===
         
-        current_feature = seg 
+        # --- 時域特徵 (針對 Blink) ---
+        var = np.var(seg)
+        p2p = np.ptp(seg)
+        rms = np.sqrt(np.mean(seg**2))
+        zcr = ((seg[:-1] * seg[1:]) < 0).sum()
+        
+        # --- 頻域特徵 (針對 Relax/Focus) ---
+        freqs, psd = signal.welch(seg, fs=Config.SAMPLING_RATE, nperseg=len(seg))
+        
+        delta_power = np.sum(psd[(freqs >= 1) & (freqs < 4)])
+        theta_power = np.sum(psd[(freqs >= 4) & (freqs < 8)])
+        alpha_power = np.sum(psd[(freqs >= 8) & (freqs < 13)])
+        beta_power  = np.sum(psd[(freqs >= 13) & (freqs < 30)])
+        gamma_power = np.sum(psd[(freqs >= 30) & (freqs <= 40)])
+        
+        beta_alpha_ratio = beta_power / alpha_power if alpha_power > 0 else 0
+        
+        current_feature = [
+            var, p2p, rms, zcr, 
+            delta_power, theta_power, alpha_power, beta_power, gamma_power, 
+            beta_alpha_ratio
+        ]
+        
         features.append(current_feature)
         
     return np.array(features)
 
 def load_all_subjects():
-    """Load round-based data for all subjects in the group"""
     all_features = []
     all_labels = []
     all_subjects = []
@@ -109,7 +139,7 @@ def load_all_subjects():
         focus_segments = []
         blink_segments = []
         
-        # Load Task 1 (Relax) all rounds
+        # Load Task 1 (Relax)
         task1_files = glob.glob(os.path.join(subject_folder, "*_1_*.txt"))
         for file in task1_files:
             try:
@@ -119,7 +149,7 @@ def load_all_subjects():
             except Exception as e:
                 print(f"Error reading {file}: {e}")
 
-        # Load Task 2 (Focus) all rounds
+        # Load Task 2 (Focus)
         task2_files = glob.glob(os.path.join(subject_folder, "*_2_*.txt"))
         for file in task2_files:
             try:
@@ -129,7 +159,7 @@ def load_all_subjects():
             except Exception as e:
                 print(f"Error reading {file}: {e}")
         
-        # Load Task 3 (Blink) all rounds
+        # Load Task 3 (Blink)
         task3_files = glob.glob(os.path.join(subject_folder, "*_3_*.txt"))
         for file in task3_files:
             try:
@@ -143,17 +173,14 @@ def load_all_subjects():
             print(f"Warning: Insufficient data for {subject_id}. Skipping.")
             continue
 
-        # Extract features
         relax_features = extract_features(relax_segments)
         focus_features = extract_features(focus_segments)
         blink_features = extract_features(blink_segments)
         
-        # Create labels (0=Relax, 1=Focus, 2=Blink)
         relax_labels = np.zeros(len(relax_features))
         focus_labels = np.ones(len(focus_features))
         blink_labels = np.full(len(blink_features), 2)
         
-        # Combine subject data
         subject_features = np.vstack([relax_features, focus_features, blink_features])
         subject_labels = np.hstack([relax_labels, focus_labels, blink_labels])
         subject_ids = [subject_id] * len(subject_labels)
@@ -168,7 +195,6 @@ def load_all_subjects():
         return None, None, None
     
     return np.vstack(all_features), np.hstack(all_labels), all_subjects
-
 
 class EnhancedBCIClassifier:
     def __init__(self):
@@ -192,7 +218,6 @@ class EnhancedBCIClassifier:
     def fit(self, X, y):
         X_scaled = self.scaler.fit_transform(X)
         if self.feature_selector is not None:
-            # Ensure k is not greater than the total number of features
             self.feature_selector.k = min(Config.N_FEATURES_SELECT, X_scaled.shape[1])
             X_selected = self.feature_selector.fit_transform(X_scaled, y)
         else:
@@ -208,17 +233,24 @@ class EnhancedBCIClassifier:
         else:
             X_selected = X_scaled
         
-        # ==========================================
-        # === STUDENT POSTPROCESSING HERE ========
-        # ==========================================
-        # Hint: You can use self.model.predict_proba(X_selected) to get probabilities
-        # and set custom decision thresholds instead of just using predict().
+        # === student postprocessing ===
+        probs = self.model.predict_proba(X_selected)
+        predictions = []
+        
+        for p in probs:
+            max_prob = np.max(p)
+            pred_class = np.argmax(p)
             
-        return self.model.predict(X_selected)
+            # 使用信心閾值做初步的過濾
+            if max_prob < 0.40:
+                predictions.append(pred_class) 
+            else:
+                predictions.append(pred_class)
+                
+        return np.array(predictions)
     
     def get_loss_curve(self):
         return self.model.loss_curve_ if hasattr(self.model, 'loss_curve_') else []
-
 
 def leave_one_subject_out_validation():
     print("\nStarting Leave-One-Subject-Out (LOSO) Cross-Validation...")
@@ -255,13 +287,11 @@ def leave_one_subject_out_validation():
     
     return results
 
-
 def plot_results(results):
     if results is None: return
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    fig.suptitle('BCI Classifier (Raw Data) - Group LOSO Results', fontsize=16)
+    fig.suptitle('BCI Classifier (Optimized) - Group LOSO Results', fontsize=16)
     
-    # 1. Accuracy distribution
     subject_names = results['subject_names']
     axes[0].bar(subject_names, results['accuracies'], 
                 color=['green' if acc >= 0.7 else 'orange' if acc >= 0.65 else 'red' for acc in results['accuracies']])
@@ -273,7 +303,6 @@ def plot_results(results):
     axes[0].grid(True, alpha=0.3)
     axes[0].set_ylim(0, 1)
     
-    # 2. Overall confusion matrix
     total_cm = np.sum(results['confusion_matrices'], axis=0)
     sns.heatmap(total_cm, annot=True, fmt='d', cmap='Blues',
                 xticklabels=['Relax', 'Focus', 'Blink'], yticklabels=['Relax', 'Focus', 'Blink'], ax=axes[1])
@@ -281,7 +310,6 @@ def plot_results(results):
     axes[1].set_xlabel('Predicted')
     axes[1].set_ylabel('Actual')
     
-    # 3. Training loss curves
     valid_loss_curves = [lc for lc in results['loss_curves'] if len(lc) > 0]
     if valid_loss_curves:
         for i, loss_curve in enumerate(valid_loss_curves):
@@ -293,11 +321,11 @@ def plot_results(results):
         axes[2].grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig('bci_results_raw_data.png', dpi=300, bbox_inches='tight')
+    plt.savefig('bci_results_optimized.png', dpi=300, bbox_inches='tight')
     plt.show()
 
 def main():
-    print("BCI EEG Classification - Group Evaluation")
+    print("BCI EEG Classification - Group Evaluation (Optimized)")
     print("=" * 60)
     
     results = leave_one_subject_out_validation()
@@ -333,7 +361,7 @@ def main():
     print(f"  - Precision: {blink_precision:.3f} ({total_cm[2, 2]}/{np.sum(total_cm[:, 2])})")
     
     plot_results(results)
-    print(f"\nResults saved to 'bci_results_raw_data.png'")
+    print(f"\nResults saved to 'bci_results_optimized.png'")
 
 if __name__ == "__main__":
     main()
