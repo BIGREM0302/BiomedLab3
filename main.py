@@ -18,6 +18,7 @@ import warnings
 from scipy import signal
 from scipy.ndimage import median_filter
 import pywt
+from scipy import stats
 # ==========================================
 warnings.filterwarnings('ignore')
 
@@ -95,48 +96,36 @@ def bandpower(seg, fs, band):  ### [MODIFIED]
 
 
 def extract_features(segments):
-    """
-    Perform feature engineering on segments
-    """
     features = []
     bands = {
-        'Delta': (1, 4),
-        'Theta': (4, 8),
-        'Alpha': (8, 13),
-        'Beta': (13, 30),
-        'Gamma': (30, 50)
+        'Delta': (1, 4), 'Theta': (4, 8), 'Alpha': (8, 13), 'Beta': (13, 30), 'Gamma': (30, 50)
     }
 
     for seg in segments:
         feat = []
 
-        # === 1. 保留原始時域特徵 (Blink 判斷關鍵) === ### [MODIFIED]
-        # 必須在 Z-score 之前計算，保留原始振幅差距
-        ptp_amplitude = np.max(seg) - np.min(seg)
-        variance = np.var(seg)
-
-        # === 2. PER-SEGMENT NORMALIZATION (Z-SCORE) === ### [MODIFIED]
-        # 消除每個人的頭骨厚度、導電狀態造成的整體電壓差異
+        # 1. 逐段標準化 (Per-segment Z-score)
         seg_norm = (seg - np.mean(seg)) / (np.std(seg) + 1e-8)
 
-        # === 3. RELATIVE BANDPOWER === ### [MODIFIED]
+        # 2. 相對頻段能量 (使用標準化後的波形)
         abs_powers = []
         for b in bands.values():
-            # 注意：這裡改用標準化後的 seg_norm 來算能量
             bp = bandpower(seg_norm, Config.SAMPLING_RATE, b)
             abs_powers.append(bp)
         
-        # 計算總能量，並將各頻段能量轉為「比例 (0~1)」
         total_power = sum(abs_powers) + 1e-8
         for bp in abs_powers:
-            feat.append(bp / total_power) 
+            feat.append(bp / total_power)  # 加入 5 個相對能量
 
-        # === 4. 組合所有特徵 ===
-        feat.append(variance)      # index 5
-        feat.append(ptp_amplitude) # index 6 (稍後用來抓 Blink)
-        feat.append(np.mean(np.abs(seg_norm)))
-        feat.append(signal.skew(seg_norm)) if hasattr(signal, 'skew') else feat.append(0)
-        feat.append(signal.kurtosis(seg_norm)) if hasattr(signal, 'kurtosis') else feat.append(0)
+        # 3. 神經科學黃金指標
+        feat.append(abs_powers[2] / (abs_powers[3] + 1e-8)) # ABR (Alpha/Beta Ratio)
+        feat.append(abs_powers[1] / (abs_powers[3] + 1e-8)) # TBR (Theta/Beta Ratio)
+
+        # === 💥 4. 針對眨眼 (Blink) 的跨受測者強效特徵 === ### [MODIFIED]
+        # 放棄絕對電壓，改看 Z-score 後的「相對峰對峰值」與「波形尖銳度」
+        feat.append(np.max(seg_norm) - np.min(seg_norm)) # Z-score PTP (眨眼通常會異常飆高)
+        feat.append(stats.kurtosis(seg_norm))           # 峰度 Kurtosis (抓取眨眼的尖銳突波)
+        feat.append(np.log(np.var(seg) + 1e-8))          # 取 Log 的變異數 (壓縮個體極端差異)
 
         features.append(feat)
 
@@ -234,80 +223,42 @@ def load_all_subjects():
 class EnhancedBCIClassifier:
     def __init__(self):
         self.model = MLPClassifier(
-            hidden_layer_sizes=Config.HIDDEN_LAYERS,
-            max_iter=Config.MAX_ITER,
-            learning_rate_init=Config.LEARNING_RATE,
-            alpha=Config.ALPHA,
-            activation=Config.ACTIVATION,
-            solver=Config.SOLVER,
-            batch_size=Config.BATCH_SIZE,
-            early_stopping=Config.EARLY_STOPPING,
-            validation_fraction=Config.VALIDATION_FRACTION,
-            n_iter_no_change=Config.N_ITER_NO_CHANGE,
-            random_state=Config.RANDOM_STATE,
+            hidden_layer_sizes=(32, 16),  # ### [MODIFIED] 輕量化網路，防死背
+            max_iter=1000,
+            learning_rate_init=0.005,
+            alpha=0.1,                    # ### [MODIFIED] 增強 L2 正則化，強迫尋找泛化規律
+            activation='relu',
+            solver='adam',
+            batch_size=64,
+            early_stopping=True,
+            random_state=42,
             verbose=False
         )
         self.scaler = StandardScaler()
-        self.feature_selector = SelectKBest(f_classif, k=Config.N_FEATURES_SELECT) if Config.FEATURE_SELECTION else None
-        self.blink_threshold = 0  # === 新增：用來記憶 Blink 的專屬門檻 === ### [MODIFIED]
-        
+        # 特徵已經精煉過，直接全拿
+        self.feature_selector = SelectKBest(f_classif, k='all') 
+
     def fit(self, X, y):
-        # === 1. 計算 Blink 專屬物理門檻 === ### [MODIFIED]
-        # 特徵 index 6 是我們剛剛算的 ptp_amplitude
-        ptp_features = X[:, 6] 
-        blink_ptp = ptp_features[y == 2]
-        non_blink_ptp = ptp_features[y != 2]
-        
-        if len(blink_ptp) > 0 and len(non_blink_ptp) > 0:
-            # 抓非眨眼的高標(95%)與眨眼的低標(5%)，取中間值當作安全門檻
-            self.blink_threshold = (np.percentile(non_blink_ptp, 95) + np.percentile(blink_ptp, 5)) / 2
-        
-        # === 2. 濾除 Blink，只讓 MLP 學習純腦波 (Relax=0, Focus=1) === ### [MODIFIED]
-        mask_eeg = (y == 0) | (y == 1)
-        X_eeg = X[mask_eeg]
-        y_eeg = y[mask_eeg]
-        
-        X_scaled = self.scaler.fit_transform(X_eeg)
-        if self.feature_selector is not None:
-            self.feature_selector.k = min(Config.N_FEATURES_SELECT, X_scaled.shape[1])
-            X_selected = self.feature_selector.fit_transform(X_scaled, y_eeg)
-        else:
-            X_selected = X_scaled
-        
-        self.model.fit(X_selected, y_eeg)
+        # === 💥 [MODIFIED] 取消所有手動門檻，讓 MLP 學習全部 3 個類別 ===
+        X_scaled = self.scaler.fit_transform(X)
+        self.model.fit(X_scaled, y)
         return self
         
     def predict(self, X, smoothing_window=5):
-        predictions = np.zeros(len(X), dtype=int)
+        X_scaled = self.scaler.transform(X)
+        probs = self.model.predict_proba(X_scaled)
         
-        # === 1. 第一層過濾：用物理規則抓出 Blink === ### [MODIFIED]
-        ptp_features = X[:, 6]
-        is_blink = ptp_features > self.blink_threshold
-        predictions[is_blink] = 2  # 直接蓋章認定為 Blink (2)
+        # 多分類標準作法：取機率最大的類別
+        raw_predictions = np.argmax(probs, axis=1)
         
-        # === 2. 第二層過濾：剩下的交給 MLP 預測純腦波 === ### [MODIFIED]
-        is_eeg = ~is_blink
-        if np.any(is_eeg):
-            X_eeg = X[is_eeg]
-            X_scaled = self.scaler.transform(X_eeg)
-            if self.feature_selector is not None:
-                X_selected = self.feature_selector.transform(X_scaled)
-            else:
-                X_selected = X_scaled
-                
-            probs = self.model.predict_proba(X_selected)
-            # 由於 MLP 只被餵過 0 和 1，所以預測結果只會是 0 或 1
-            predictions[is_eeg] = np.argmax(probs, axis=1)
-            
-        # === 3. 整體時間平滑化 (Majority Vote) ===
+        # 加上時間多數決平滑化
         if smoothing_window > 1:
-            predictions = median_filter(predictions, size=smoothing_window)
+            raw_predictions = median_filter(raw_predictions, size=smoothing_window)
 
-        return predictions
+        return raw_predictions
     
     def get_loss_curve(self):
         return self.model.loss_curve_ if hasattr(self.model, 'loss_curve_') else []
-
 
 def leave_one_subject_out_validation():
     print("\nStarting Leave-One-Subject-Out (LOSO) Cross-Validation...")
