@@ -3,7 +3,7 @@ Brain-Computer Interface MLP Classifier (BrainLink Version)
 For EEG signal relaxation/focus/blink state classification
 USE RAW DATA AS INPUT
 """
-#hi
+#hi hi
 
 import numpy as np
 import matplotlib.pyplot as plt
