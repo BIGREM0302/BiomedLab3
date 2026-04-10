@@ -1,2 +1,8 @@
 *.txt
+*.json
+*.zip
 .venv/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+bci_dataset_114-2/
