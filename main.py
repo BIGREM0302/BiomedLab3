@@ -1,8 +1,6 @@
 """
-Brain-Computer Interface MLP Classifier (BrainLink Version)
-For EEG signal relaxation/focus/blink state classification
-USE RAW DATA AS INPUT
-max
+Brain-Computer Interface MLP Classifier
+FINAL VERSION: DYNAMIC SEGMENTATION + HJORTH COMPLEXITY & RELATIVE POWER
 """
 
 import numpy as np
@@ -12,60 +10,53 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, confusion_matrix
 from sklearn.neural_network import MLPClassifier
 from sklearn.feature_selection import SelectKBest, f_classif
+from scipy import signal
+from scipy.stats import kurtosis, skew
 import os
 import glob
 import warnings
-# ==========================================
-from scipy import signal
-from scipy.ndimage import median_filter
-import pywt
-# ==========================================
 warnings.filterwarnings('ignore')
 
 # Parameter Settings
 class Config:
-    # Dataset path settings
     DATASET_PATH = "bci_dataset_114-2"
+    SKIP_SECONDS = 2.0                 # 捨棄每回合開頭前 2 秒
+    
+    # === 策略 A：針對連續狀態 (Relax / Focus) ===
+    RF_SEG_LEN = 4.0                   # 窗口大一點，頻譜解析度才高
+    RF_OVERLAP = 0.7                   # 重疊率高一點，資料量才多
+    # 【關鍵修改 1】嚴格過濾！真正的腦波不會超過 800，超過的都是肌肉或眼動雜訊，直接丟棄！
+    RF_MAX_THRES = 800                 
+
+    # === 策略 B：針對瞬間狀態 (Blink) ===
+    BLINK_SEG_LEN = 1.5                # 窗口縮小，聚焦眨眼瞬間，避免被背景稀釋
+    BLINK_OVERLAP = 0.0                # 重疊率 0，不重複計算同一個眨眼
+    BLINK_MIN_THRES = 500              # 必須有大於 500 的突波才承認是眨眼
     
     # MLP model parameters
-    HIDDEN_LAYERS = (64,32)
-    MAX_ITER = 1000
-    LEARNING_RATE = 0.001
-    ALPHA = 0.0005
-    ACTIVATION = 'relu'
-    SOLVER = 'adam'
-    BATCH_SIZE = 64
-    EARLY_STOPPING = True
+    HIDDEN_LAYERS = (64, 32)           
+    MAX_ITER = 200                     
+    LEARNING_RATE = 0.005              
+    ALPHA = 0.05                       # 提高正規化強度，防止模型死背特徵
+    ACTIVATION = 'relu'                
+    SOLVER = 'adam'                    
+    BATCH_SIZE = 128                   
+    EARLY_STOPPING = True              
     VALIDATION_FRACTION = 0.1
-    N_ITER_NO_CHANGE = 10
-    
-    # Signal processing parameters
-    SAMPLING_RATE = 512    # BrainLink fixed sampling rate
-    SEGMENT_LENGTH = 2     # Segment length in seconds
-    OVERLAP_RATIO = 0.2    # Overlap ratio for segments
-    
-    # Feature selection parameters
-    FEATURE_SELECTION = True
-    N_FEATURES_SELECT = 30 # Modify preprocessing to extract truly effective features
-    
-    # Other settings
+    N_ITER_NO_CHANGE = 15
+    SAMPLING_RATE = 512                
+    FEATURE_SELECTION = False
+    N_FEATURES_SELECT = 10             # 精簡為 10 個最強比例與複雜度特徵
     RANDOM_STATE = 42
 
-# ==========================================
-# Preprocessing 
-# ==========================================
-def bandpass_filter(data, fs, low=1, high=45):  ### [MODIFIED]
-    b, a = signal.butter(4, [low/(fs/2), high/(fs/2)], btype='band')
-    return signal.filtfilt(b, a, data)
-
-
-def notch_filter(data, fs, freq=50):  ### [MODIFIED]
-    b, a = signal.iirnotch(freq/(fs/2), Q=30)
-    return signal.filtfilt(b, a, data)
-# =========================================
-
-def create_segments(data, segment_length_samples, overlap_samples):
-    """Split a single round of continuous EEG signal into multiple segments"""
+def create_segments(data, segment_length_samples, overlap_samples, task_type):
+    """根據不同任務類型，執行不同的切割與過濾策略"""
+    skip_samples = int(Config.SKIP_SECONDS * Config.SAMPLING_RATE)
+    if len(data) > skip_samples:
+        data = data[skip_samples:]
+    else:
+        return []
+        
     if len(data) < segment_length_samples:
         return []
     
@@ -73,176 +64,156 @@ def create_segments(data, segment_length_samples, overlap_samples):
     start = 0
     step = segment_length_samples - overlap_samples
     
-    # === FILTER FIRST === ### [MODIFIED]
-    data = bandpass_filter(data, Config.SAMPLING_RATE)
-    data = notch_filter(data, Config.SAMPLING_RATE)
+    nyq = 0.5 * Config.SAMPLING_RATE
+    low, high = 0.5 / nyq, 45.0 / nyq
+    b, a = signal.butter(4, [low, high], btype='band')
+    # first filter
+    #data_filtered = signal.filtfilt(b, a, data)
 
     while start + segment_length_samples <= len(data):
         segment = data[start:start + segment_length_samples]
-
-        segment = signal.detrend(segment)
-        segment = segment * np.hamming(len(segment))
-
-        segments.append(segment)
+        segment_filtered = signal.filtfilt(b, a, segment)
+        #segment_filtered = data_filtered[start:start + segment_length_samples]
+        peak_amp = np.max(np.abs(segment_filtered))
+        
+        # === 核心邏輯：依照任務進行智能過濾 ===
+        if task_type == 1: # Relax
+            # 放寬 Relax 的標準，多收一點資料進來訓練
+            if peak_amp > 1500: 
+                start += step
+                continue 
+        elif task_type == 2: # Focus
+            if peak_amp > Config.RF_MAX_THRES:
+                start += step
+                continue
+                
+        elif task_type == 3:    # Blink
+            # 如果這個小視窗內沒有出現足夠大的突波，代表它切到了「沒眨眼」的空白期
+            if peak_amp < Config.BLINK_MIN_THRES:
+                start += step
+                continue # 沒有眨眼的片段直接丟棄，防止標籤污染
+            
+        segments.append(segment_filtered)
         start += step
-
+        
     return segments
-    # =========================================
-
-def bandpower(seg, fs, band):  ### [MODIFIED]
-    f, Pxx = signal.welch(seg, fs=fs)
-    idx = np.logical_and(f >= band[0], f <= band[1])
-    return np.trapz(Pxx[idx], f[idx])
-
 
 def extract_features(segments):
-    """
-    Perform feature engineering on segments
-    """
+    """【關鍵修改 2】全面改用「相對比例」與「波形複雜度 (Hjorth)」"""
     features = []
-    bands = {
-        'Delta': (1, 4),
-        'Theta': (4, 8),
-        'Alpha': (8, 13),
-        'Beta': (13, 30),
-        'Gamma': (30, 50)
-    }
-
     for seg in segments:
-        feat = []
-
-        # === 1. 保留原始時域特徵 (Blink 判斷關鍵) === ### [MODIFIED]
-        # 必須在 Z-score 之前計算，保留原始振幅差距
-        ptp_amplitude = np.max(seg) - np.min(seg)
-        variance = np.var(seg)
-
-        # === 2. PER-SEGMENT NORMALIZATION (Z-SCORE) === ### [MODIFIED]
-        # 消除每個人的頭骨厚度、導電狀態造成的整體電壓差異
-        seg_norm = (seg - np.mean(seg)) / (np.std(seg) + 1e-8)
-
-        # === 3. RELATIVE BANDPOWER === ### [MODIFIED]
-        abs_powers = []
-        for b in bands.values():
-            # 注意：這裡改用標準化後的 seg_norm 來算能量
-            bp = bandpower(seg_norm, Config.SAMPLING_RATE, b)
-            abs_powers.append(bp)
+        # 1. Hjorth Parameters (Activity, Mobility, Complexity)
+        # 這是對抗單通道雜訊最強的時域特徵，完全不受絕對振幅影響
+        activity = np.var(seg) + 1e-7
+        diff1 = np.diff(seg)
+        diff2 = np.diff(diff1)
         
-        # 計算總能量，並將各頻段能量轉為「比例 (0~1)」
-        total_power = sum(abs_powers) + 1e-8
-        for bp in abs_powers:
-            feat.append(bp / total_power) 
-
-        # === 4. 組合所有特徵 ===
-        feat.append(variance)      # index 5
-        feat.append(ptp_amplitude) # index 6 (稍後用來抓 Blink)
-        feat.append(np.mean(np.abs(seg_norm)))
-        feat.append(signal.skew(seg_norm)) if hasattr(signal, 'skew') else feat.append(0)
-        feat.append(signal.kurtosis(seg_norm)) if hasattr(signal, 'kurtosis') else feat.append(0)
-
-        features.append(feat)
-
+        var_diff1 = np.var(diff1) + 1e-7
+        var_diff2 = np.var(diff2) + 1e-7
+        
+        mobility = np.sqrt(var_diff1 / activity)
+        complexity = np.sqrt(var_diff2 / var_diff1) / mobility
+        
+        # 2. 頻域相對能量 (Relative Power)
+        nperseg = min(len(seg), int(Config.SAMPLING_RATE * 1.0)) 
+        freqs, psd = signal.welch(seg, fs=Config.SAMPLING_RATE, nperseg=nperseg)
+        
+        theta = np.sum(psd[(freqs >= 4) & (freqs < 8)])
+        alpha = np.sum(psd[(freqs >= 8) & (freqs < 13)])
+        beta  = np.sum(psd[(freqs >= 13) & (freqs < 30)])
+        total_power = theta + alpha + beta + 1e-9
+        
+        # 轉換為百分比 (0~1 之間)，消除個體電壓大小差異
+        rel_theta = theta / total_power
+        rel_alpha = alpha / total_power
+        rel_beta  = beta / total_power
+        
+        # 專注/放鬆黃金比例
+        beta_alpha_ratio = np.log10((beta / (alpha + 1e-9)) + 1)
+        
+        # 3. 輔助特徵 (主要為了完美保留 Blink 的高辨識度)
+        kurt = kurtosis(seg)
+        p2p_norm = np.ptp(seg) / (np.std(seg) + 1e-7) # 波峰因數 (Crest Factor)
+        
+        current_feature = [
+            mobility, complexity, 
+            rel_theta, rel_alpha, rel_beta, beta_alpha_ratio,
+            kurt, p2p_norm,
+            np.log10(activity),  # 總能量取對數
+            np.max(np.abs(seg))  # 絕對最大值 (對 Blink 還是很有效)
+        ]
+        features.append(current_feature)
     return np.array(features)
 
-
 def load_all_subjects():
-    """Load round-based data for all subjects in the group"""
-    all_features = []
-    all_labels = []
-    all_subjects = []
-    
-    if not os.path.exists(Config.DATASET_PATH):
-        print(f"Error: Directory '{Config.DATASET_PATH}' not found")
-        return None, None, None
-        
+    all_features, all_labels, all_subjects = [], [], []
+    if not os.path.exists(Config.DATASET_PATH): return None, None, None
     subject_folders = sorted([f.path for f in os.scandir(Config.DATASET_PATH) if f.is_dir()])
     
-    if len(subject_folders) < 2:
-        print("Error: Not enough subjects. At least 2 subject folders are required for cross-validation.")
-        return None, None, None
-        
-    print(f"Found {len(subject_folders)} subjects. Loading data...")
-    
-    segment_length_samples = int(Config.SEGMENT_LENGTH * Config.SAMPLING_RATE)
-    overlap_samples = int(segment_length_samples * Config.OVERLAP_RATIO)
+    rf_seg_len = int(Config.RF_SEG_LEN * Config.SAMPLING_RATE)
+    rf_overlap = int(rf_seg_len * Config.RF_OVERLAP)
+    blk_seg_len = int(Config.BLINK_SEG_LEN * Config.SAMPLING_RATE)
+    blk_overlap = int(blk_seg_len * Config.BLINK_OVERLAP)
 
-    for subject_folder in subject_folders:
-        subject_id = os.path.basename(subject_folder)
-        relax_segments = []
-        focus_segments = []
-        blink_segments = []
+    for folder in subject_folders:
+        sub_id = os.path.basename(folder)
+        sub_segs = {1: [], 2: [], 3: []}
         
-        # Load Task 1 (Relax) all rounds
-        task1_files = glob.glob(os.path.join(subject_folder, "*_1_*.txt"))
-        for file in task1_files:
-            try:
-                data = np.loadtxt(file)
-                segs = create_segments(data, segment_length_samples, overlap_samples)
-                relax_segments.extend(segs)
-            except Exception as e:
-                print(f"Error reading {file}: {e}")
-
-        # Load Task 2 (Focus) all rounds
-        task2_files = glob.glob(os.path.join(subject_folder, "*_2_*.txt"))
-        for file in task2_files:
-            try:
-                data = np.loadtxt(file)
-                segs = create_segments(data, segment_length_samples, overlap_samples)
-                focus_segments.extend(segs)
-            except Exception as e:
-                print(f"Error reading {file}: {e}")
+        for task in [1, 2, 3]:
+            files = glob.glob(os.path.join(folder, f"*_{task}_*.txt"))
+            for f in files:
+                try:
+                    with open(f, 'r', encoding='utf-8', errors='ignore') as file:
+                        lines = file.readlines()
+                        clean_data = []
+                        for line in lines:
+                            val = line.strip()
+                            if val:
+                                try: clean_data.append(float(val))
+                                except ValueError: pass 
+                    data = np.array(clean_data)
+                    
+                    if task in [1, 2]:
+                        segs = create_segments(data, rf_seg_len, rf_overlap, task)
+                    else:
+                        segs = create_segments(data, blk_seg_len, blk_overlap, task)
+                    sub_segs[task].extend(segs)
+                        
+                except Exception as e:
+                    continue
         
-        # Load Task 3 (Blink) all rounds
-        task3_files = glob.glob(os.path.join(subject_folder, "*_3_*.txt"))
-        for file in task3_files:
-            try:
-                data = np.loadtxt(file)
-                segs = create_segments(data, segment_length_samples, overlap_samples)
-                blink_segments.extend(segs)
-            except Exception as e:
-                print(f"Error reading {file}: {e}")
-
-        if len(relax_segments) == 0 or len(focus_segments) == 0 or len(blink_segments) == 0:
-            print(f"Warning: Insufficient data for {subject_id}. Skipping.")
+        if not (sub_segs[1] and sub_segs[2] and sub_segs[3]): 
+            print(f"Warning: Subject {sub_id} missing valid task data. Skipping.")
             continue
 
-        # Extract features
-        relax_features = extract_features(relax_segments)
-        focus_features = extract_features(focus_segments)
-        blink_features = extract_features(blink_segments)
+        f1 = extract_features(sub_segs[1])
+        f2 = extract_features(sub_segs[2])
+        f3 = extract_features(sub_segs[3])
         
-        # Create labels (0=Relax, 1=Focus, 2=Blink)
-        relax_labels = np.zeros(len(relax_features))
-        focus_labels = np.ones(len(focus_features))
-        blink_labels = np.full(len(blink_features), 2)
+        sub_feat = np.vstack([f1, f2, f3])
+        sub_feat = StandardScaler().fit_transform(sub_feat) 
         
-        # Combine subject data
-        subject_features = np.vstack([relax_features, focus_features, blink_features])
-        subject_labels = np.hstack([relax_labels, focus_labels, blink_labels])
-        subject_ids = [subject_id] * len(subject_labels)
+        sub_lab = np.hstack([np.zeros(len(f1)), np.ones(len(f2)), np.full(len(f3), 2)])
+        all_features.append(sub_feat)
+        all_labels.append(sub_lab)
+        all_subjects.extend([sub_id] * len(sub_lab))
         
-        all_features.append(subject_features)
-        all_labels.append(subject_labels)
-        all_subjects.extend(subject_ids)
-        
-        print(f" - {subject_id}: Successfully loaded {len(relax_segments)} Relax, {len(focus_segments)} Focus, {len(blink_segments)} Blink segments")
+        print(f" - {sub_id}: Loaded Focus/Relax({len(f1)+len(f2)}) & Blink({len(f3)}) segments")
     
-    if not all_features:
-        return None, None, None
-    
+    if not all_features: return None, None, None
     return np.vstack(all_features), np.hstack(all_labels), all_subjects
-
 
 class EnhancedBCIClassifier:
     def __init__(self):
         self.model = MLPClassifier(
-            hidden_layer_sizes=Config.HIDDEN_LAYERS,
+            hidden_layer_sizes=Config.HIDDEN_LAYERS, 
             max_iter=Config.MAX_ITER,
-            learning_rate_init=Config.LEARNING_RATE,
+            learning_rate_init=Config.LEARNING_RATE, 
             alpha=Config.ALPHA,
-            activation=Config.ACTIVATION,
-            solver=Config.SOLVER,
+            activation=Config.ACTIVATION, 
+            solver=Config.SOLVER, 
             batch_size=Config.BATCH_SIZE,
-            early_stopping=Config.EARLY_STOPPING,
+            early_stopping=Config.EARLY_STOPPING, 
             validation_fraction=Config.VALIDATION_FRACTION,
             n_iter_no_change=Config.N_ITER_NO_CHANGE,
             random_state=Config.RANDOM_STATE,
@@ -250,101 +221,59 @@ class EnhancedBCIClassifier:
         )
         self.scaler = StandardScaler()
         self.feature_selector = SelectKBest(f_classif, k=Config.N_FEATURES_SELECT) if Config.FEATURE_SELECTION else None
-        self.blink_threshold = 0  # === 新增：用來記憶 Blink 的專屬門檻 === ### [MODIFIED]
         
     def fit(self, X, y):
-        # === 1. 計算 Blink 專屬物理門檻 === ### [MODIFIED]
-        # 特徵 index 6 是我們剛剛算的 ptp_amplitude
-        ptp_features = X[:, 6] 
-        blink_ptp = ptp_features[y == 2]
-        non_blink_ptp = ptp_features[y != 2]
-        
-        if len(blink_ptp) > 0 and len(non_blink_ptp) > 0:
-            # 抓非眨眼的高標(95%)與眨眼的低標(5%)，取中間值當作安全門檻
-            self.blink_threshold = (np.percentile(non_blink_ptp, 95) + np.percentile(blink_ptp, 5)) / 2
-        
-        # === 2. 濾除 Blink，只讓 MLP 學習純腦波 (Relax=0, Focus=1) === ### [MODIFIED]
-        mask_eeg = (y == 0) | (y == 1)
-        X_eeg = X[mask_eeg]
-        y_eeg = y[mask_eeg]
-        
-        X_scaled = self.scaler.fit_transform(X_eeg)
-        if self.feature_selector is not None:
-            self.feature_selector.k = min(Config.N_FEATURES_SELECT, X_scaled.shape[1])
-            X_selected = self.feature_selector.fit_transform(X_scaled, y_eeg)
-        else:
-            X_selected = X_scaled
-        
-        self.model.fit(X_selected, y_eeg)
+        X_scaled = self.scaler.fit_transform(X)
+        X_selected = self.feature_selector.fit_transform(X_scaled, y) if self.feature_selector else X_scaled
+        self.model.fit(X_selected, y)
         return self
+    
+    def predict(self, X):
+        X_scaled = self.scaler.transform(X)
+        X_selected = self.feature_selector.transform(X_scaled) if self.feature_selector else X_scaled
         
-    def predict(self, X, smoothing_window=5):
+        # 1. 取得三個類別的機率 [Relax(0), Focus(1), Blink(2)]
+        probs = self.model.predict_proba(X_selected)
+        
         predictions = np.zeros(len(X), dtype=int)
         
-        # === 1. 第一層過濾：用物理規則抓出 Blink === ### [MODIFIED]
-        ptp_features = X[:, 6]
-        is_blink = ptp_features > self.blink_threshold
-        predictions[is_blink] = 2  # 直接蓋章認定為 Blink (2)
-        
-        # === 2. 第二層過濾：剩下的交給 MLP 預測純腦波 === ### [MODIFIED]
-        is_eeg = ~is_blink
-        if np.any(is_eeg):
-            X_eeg = X[is_eeg]
-            X_scaled = self.scaler.transform(X_eeg)
-            if self.feature_selector is not None:
-                X_selected = self.feature_selector.transform(X_scaled)
+        # 2. 客製化門檻邏輯
+        for i in range(len(X)):
+            # 只要 Relax 的機率超過 0.35 (不用等到 0.5 或最高)，就判定為 Relax
+            if probs[i, 0] > 0.37:  
+                predictions[i] = 0
             else:
-                X_selected = X_scaled
+                # 剩下的再讓 Focus 和 Blink 去比誰機率高
+                # np.argmax(probs[i, 1:]) 會回傳 0(對應Focus) 或 1(對應Blink)，所以要 +1
+                predictions[i] = np.argmax(probs[i, 1:]) + 1
                 
-            probs = self.model.predict_proba(X_selected)
-            # 由於 MLP 只被餵過 0 和 1，所以預測結果只會是 0 或 1
-            predictions[is_eeg] = np.argmax(probs, axis=1)
-            
-        # === 3. 整體時間平滑化 (Majority Vote) ===
-        if smoothing_window > 1:
-            predictions = median_filter(predictions, size=smoothing_window)
-
+        # 3. 平滑化
+        if len(predictions) > 5:
+            return signal.medfilt(predictions, kernel_size=11) 
         return predictions
-    
-    def get_loss_curve(self):
-        return self.model.loss_curve_ if hasattr(self.model, 'loss_curve_') else []
-
 
 def leave_one_subject_out_validation():
     print("\nStarting Leave-One-Subject-Out (LOSO) Cross-Validation...")
-    
     X, y, subjects = load_all_subjects()
     if X is None: return None
-    
+        
     unique_subjects = sorted(list(set(subjects)))
     results = {'accuracies': [], 'confusion_matrices': [], 'loss_curves': [], 'subject_names': []}
     
-    print("\n" + "="*40)
-    for test_subject in unique_subjects:
-        train_mask = [s != test_subject for s in subjects]
-        test_mask = [s == test_subject for s in subjects]
+    for test_sub in unique_subjects:
+        train_mask = [s != test_sub for s in subjects]
+        test_mask = [s == test_sub for s in subjects]
         
-        X_train, X_test = X[train_mask], X[test_mask]
-        y_train, y_test = y[train_mask], y[test_mask]
+        clf = EnhancedBCIClassifier().fit(X[train_mask], y[train_mask])
+        y_pred = clf.predict(X[test_mask])
         
-        print(f"Training Model (Test Subject: {test_subject}) | Train size: {len(X_train)}, Test size: {len(X_test)}")
+        results['accuracies'].append(accuracy_score(y[test_mask], y_pred))
+        results['confusion_matrices'].append(confusion_matrix(y[test_mask], y_pred, labels=[0, 1, 2]))
+        results['loss_curves'].append(clf.model.loss_curve_)
+        results['subject_names'].append(test_sub)
         
-        classifier = EnhancedBCIClassifier()
-        classifier.fit(X_train, y_train)
-        y_pred = classifier.predict(X_test)
-        
-        accuracy = accuracy_score(y_test, y_pred)
-        cm = confusion_matrix(y_test, y_pred, labels=[0, 1, 2])
-        
-        results['accuracies'].append(accuracy)
-        results['confusion_matrices'].append(cm)
-        results['loss_curves'].append(classifier.get_loss_curve())
-        results['subject_names'].append(test_subject)
-        
-        print(f" -> Accuracy: {accuracy:.3f}")
-    
+        print(f" -> {test_sub} Accuracy: {results['accuracies'][-1]:.3f}")
     return results
-
 
 def plot_results(results):
     if results is None: return
