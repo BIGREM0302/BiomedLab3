@@ -45,7 +45,7 @@ class Config:
     VALIDATION_FRACTION = 0.1
     N_ITER_NO_CHANGE = 15
     SAMPLING_RATE = 512                
-    FEATURE_SELECTION = True
+    FEATURE_SELECTION = False
     N_FEATURES_SELECT = 10             # 精簡為 10 個最強比例與複雜度特徵
     RANDOM_STATE = 42
 
@@ -75,10 +75,15 @@ def create_segments(data, segment_length_samples, overlap_samples, task_type):
         peak_amp = np.max(np.abs(segment_filtered))
         
         # === 核心邏輯：依照任務進行智能過濾 ===
-        if task_type in [1, 2]: # Relax 或 Focus
+        if task_type == 1: # Relax
+            # 放寬 Relax 的標準，多收一點資料進來訓練
+            if peak_amp > 1000: 
+                start += step
+                continue 
+        elif task_type == 2: # Focus
             if peak_amp > Config.RF_MAX_THRES:
                 start += step
-                continue # 太大的是雜訊，丟棄
+                continue
                 
         elif task_type == 3:    # Blink
             # 如果這個小視窗內沒有出現足夠大的突波，代表它切到了「沒眨眼」的空白期
@@ -122,7 +127,7 @@ def extract_features(segments):
         rel_beta  = beta / total_power
         
         # 專注/放鬆黃金比例
-        beta_alpha_ratio = beta / (alpha + 1e-9)
+        beta_alpha_ratio = np.log10((beta / (alpha + 1e-9)) + 1)
         
         # 3. 輔助特徵 (主要為了完美保留 Blink 的高辨識度)
         kurt = kurtosis(seg)
@@ -216,10 +221,26 @@ class EnhancedBCIClassifier:
     def predict(self, X):
         X_scaled = self.scaler.transform(X)
         X_selected = self.feature_selector.transform(X_scaled) if self.feature_selector else X_scaled
-        raw_preds = self.model.predict(X_selected)
-        if len(raw_preds) > 5:
-            return signal.medfilt(raw_preds, kernel_size=5) 
-        return raw_preds
+        
+        # 1. 取得三個類別的機率 [Relax(0), Focus(1), Blink(2)]
+        probs = self.model.predict_proba(X_selected)
+        
+        predictions = np.zeros(len(X), dtype=int)
+        
+        # 2. 客製化門檻邏輯
+        for i in range(len(X)):
+            # 只要 Relax 的機率超過 0.35 (不用等到 0.5 或最高)，就判定為 Relax
+            if probs[i, 0] > 0.37:  
+                predictions[i] = 0
+            else:
+                # 剩下的再讓 Focus 和 Blink 去比誰機率高
+                # np.argmax(probs[i, 1:]) 會回傳 0(對應Focus) 或 1(對應Blink)，所以要 +1
+                predictions[i] = np.argmax(probs[i, 1:]) + 1
+                
+        # 3. 平滑化
+        if len(predictions) > 5:
+            return signal.medfilt(predictions, kernel_size=11) 
+        return predictions
 
 def leave_one_subject_out_validation():
     print("\nStarting Leave-One-Subject-Out (LOSO) Cross-Validation...")
@@ -245,38 +266,44 @@ def leave_one_subject_out_validation():
     return results
 
 def plot_results(results):
+    if results is None: return
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    fig.suptitle('BCI Classifier - Complexity & Relative Power Strategy', fontsize=16)
+    fig.suptitle('BCI Classifier (Raw Data) - Group LOSO Results', fontsize=16)
     
-    axes[0].bar(results['subject_names'], results['accuracies'], color='orange')
-    axes[0].axhline(y=np.mean(results['accuracies']), color='r', linestyle='--', label=f'Mean: {np.mean(results["accuracies"]):.3f}')
-    axes[0].axhline(y=0.65, color='b', linestyle=':', label='Target 0.65')
-    axes[0].set_ylim(0, 1)
+    # 1. Accuracy distribution
+    subject_names = results['subject_names']
+    axes[0].bar(subject_names, results['accuracies'], 
+                color=['green' if acc >= 0.7 else 'orange' if acc >= 0.65 else 'red' for acc in results['accuracies']])
     axes[0].set_title('Accuracy by Subject')
     axes[0].set_ylabel('Accuracy')
+    axes[0].axhline(y=np.mean(results['accuracies']), color='r', linestyle='--', label=f'Mean: {np.mean(results["accuracies"]):.3f}')
+    axes[0].axhline(y=0.65, color='blue', linestyle=':', label='Target: 0.65')
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
+    axes[0].set_ylim(0, 1)
     
+    # 2. Overall confusion matrix
     total_cm = np.sum(results['confusion_matrices'], axis=0)
-    sns.heatmap(total_cm, annot=True, fmt='d', cmap='Blues', ax=axes[1],
-                xticklabels=['Relax', 'Focus', 'Blink'], yticklabels=['Relax', 'Focus', 'Blink'])
+    sns.heatmap(total_cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=['Relax', 'Focus', 'Blink'], yticklabels=['Relax', 'Focus', 'Blink'], ax=axes[1])
     axes[1].set_title('Overall Confusion Matrix')
     axes[1].set_xlabel('Predicted')
     axes[1].set_ylabel('Actual')
     
-    for i, lc in enumerate(results['loss_curves']): 
-        axes[2].plot(lc, alpha=0.7, label=results['subject_names'][i])
-    axes[2].set_title('Training Loss Curves')
-    axes[2].set_xlabel('Iteration')
-    axes[2].set_ylabel('Loss')
-    if len(results['subject_names']) <= 10: 
+    # 3. Training loss curves
+    valid_loss_curves = [lc for lc in results['loss_curves'] if len(lc) > 0]
+    if valid_loss_curves:
+        for i, loss_curve in enumerate(valid_loss_curves):
+            axes[2].plot(loss_curve, alpha=0.7, label=subject_names[i])
+        axes[2].set_title('Training Loss Curves')
+        axes[2].set_xlabel('Iteration')
+        axes[2].set_ylabel('Loss')
         axes[2].legend()
-    axes[2].grid(True, alpha=0.3)
+        axes[2].grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig('bci_results_optimized.png', dpi=300)
+    plt.savefig('bci_results_raw_data.png', dpi=300, bbox_inches='tight')
     plt.show()
-
 
 def main():
     print("BCI EEG Classification - Group Evaluation")
