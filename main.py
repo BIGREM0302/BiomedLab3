@@ -1,6 +1,6 @@
 """
 Brain-Computer Interface MLP Classifier
-FINAL VERSION: DYNAMIC SEGMENTATION (Class-Specific Windowing)
+FINAL VERSION: DYNAMIC SEGMENTATION + HJORTH COMPLEXITY & RELATIVE POWER
 """
 
 import numpy as np
@@ -22,22 +22,22 @@ class Config:
     DATASET_PATH = "bci_dataset_114-2"
     SKIP_SECONDS = 2.0                 # 捨棄每回合開頭前 2 秒
     
-    # === 新增：動態切分策略 (你的完美提案) ===
-    # 策略 A：針對連續狀態 (Relax / Focus)
+    # === 策略 A：針對連續狀態 (Relax / Focus) ===
     RF_SEG_LEN = 4.0                   # 窗口大一點，頻譜解析度才高
     RF_OVERLAP = 0.7                   # 重疊率高一點，資料量才多
-    RF_MAX_THRES = 2500                # 剔除過大雜訊的門檻
+    # 【關鍵修改 1】嚴格過濾！真正的腦波不會超過 800，超過的都是肌肉或眼動雜訊，直接丟棄！
+    RF_MAX_THRES = 800                 
     
-    # 策略 B：針對瞬間狀態 (Blink)
+    # === 策略 B：針對瞬間狀態 (Blink) ===
     BLINK_SEG_LEN = 1.5                # 窗口縮小，聚焦眨眼瞬間，避免被背景稀釋
     BLINK_OVERLAP = 0.0                # 重疊率 0，不重複計算同一個眨眼
-    BLINK_MIN_THRES = 500              # 【關鍵】至少要大於這個值，才承認這個片段「真的有眨眼」
+    BLINK_MIN_THRES = 500              # 必須有大於 500 的突波才承認是眨眼
     
     # MLP model parameters
     HIDDEN_LAYERS = (64, 32)           
     MAX_ITER = 200                     
     LEARNING_RATE = 0.005              
-    ALPHA = 0.02                       
+    ALPHA = 0.05                       # 提高正規化強度，防止模型死背特徵
     ACTIVATION = 'relu'                
     SOLVER = 'adam'                    
     BATCH_SIZE = 128                   
@@ -46,7 +46,7 @@ class Config:
     N_ITER_NO_CHANGE = 15
     SAMPLING_RATE = 512                
     FEATURE_SELECTION = True
-    N_FEATURES_SELECT = 12             
+    N_FEATURES_SELECT = 10             # 精簡為 10 個最強比例與複雜度特徵
     RANDOM_STATE = 42
 
 def create_segments(data, segment_length_samples, overlap_samples, task_type):
@@ -84,7 +84,7 @@ def create_segments(data, segment_length_samples, overlap_samples, task_type):
             # 如果這個小視窗內沒有出現足夠大的突波，代表它切到了「沒眨眼」的空白期
             if peak_amp < Config.BLINK_MIN_THRES:
                 start += step
-                continue # 沒有眨眼的片段直接丟棄，防止標籤污染！
+                continue # 沒有眨眼的片段直接丟棄，防止標籤污染
             
         segments.append(segment_filtered)
         start += step
@@ -92,33 +92,48 @@ def create_segments(data, segment_length_samples, overlap_samples, task_type):
     return segments
 
 def extract_features(segments):
-    """提取不受視窗長度影響的強特徵"""
+    """【關鍵修改 2】全面改用「相對比例」與「波形複雜度 (Hjorth)」"""
     features = []
     for seg in segments:
-        # 1. 時域特徵 (變異數、峰度等本來就與長度無關)
-        log_var = np.log10(np.var(seg) + 1e-7)
-        kurt = kurtosis(seg)
-        sk = skew(seg)
-        zcr = ((seg[:-1] * seg[1:]) < 0).sum() / len(seg)
+        # 1. Hjorth Parameters (Activity, Mobility, Complexity)
+        # 這是對抗單通道雜訊最強的時域特徵，完全不受絕對振幅影響
+        activity = np.var(seg) + 1e-7
+        diff1 = np.diff(seg)
+        diff2 = np.diff(diff1)
         
-        # 2. 頻域特徵 (動態調整 nperseg 以適應不同的 seg_length)
-        nperseg = min(len(seg), int(Config.SAMPLING_RATE * 1.0)) # 固定解析度為 1 秒
+        var_diff1 = np.var(diff1) + 1e-7
+        var_diff2 = np.var(diff2) + 1e-7
+        
+        mobility = np.sqrt(var_diff1 / activity)
+        complexity = np.sqrt(var_diff2 / var_diff1) / mobility
+        
+        # 2. 頻域相對能量 (Relative Power)
+        nperseg = min(len(seg), int(Config.SAMPLING_RATE * 1.0)) 
         freqs, psd = signal.welch(seg, fs=Config.SAMPLING_RATE, nperseg=nperseg)
         
-        theta = np.log10(np.sum(psd[(freqs >= 4) & (freqs < 8)]) + 1e-9)
-        alpha = np.log10(np.sum(psd[(freqs >= 8) & (freqs < 13)]) + 1e-9)
-        beta  = np.log10(np.sum(psd[(freqs >= 13) & (freqs < 30)]) + 1e-9)
-        total = np.log10(np.sum(psd[(freqs >= 1) & (freqs < 45)]) + 1e-9)
+        theta = np.sum(psd[(freqs >= 4) & (freqs < 8)])
+        alpha = np.sum(psd[(freqs >= 8) & (freqs < 13)])
+        beta  = np.sum(psd[(freqs >= 13) & (freqs < 30)])
+        total_power = theta + alpha + beta + 1e-9
         
-        rel_beta = beta - total
-        mobility = np.sqrt(np.var(np.diff(seg)) / (np.var(seg) + 1e-7))
+        # 轉換為百分比 (0~1 之間)，消除個體電壓大小差異
+        rel_theta = theta / total_power
+        rel_alpha = alpha / total_power
+        rel_beta  = beta / total_power
+        
+        # 專注/放鬆黃金比例
+        beta_alpha_ratio = beta / (alpha + 1e-9)
+        
+        # 3. 輔助特徵 (主要為了完美保留 Blink 的高辨識度)
+        kurt = kurtosis(seg)
+        p2p_norm = np.ptp(seg) / (np.std(seg) + 1e-7) # 波峰因數 (Crest Factor)
         
         current_feature = [
-            log_var, kurt, sk, zcr, mobility,
-            theta, alpha, beta, rel_beta, 
-            beta - alpha,
-            np.ptp(seg) / (np.std(seg) + 1e-7),
-            np.max(np.abs(seg))
+            mobility, complexity, 
+            rel_theta, rel_alpha, rel_beta, beta_alpha_ratio,
+            kurt, p2p_norm,
+            np.log10(activity),  # 總能量取對數
+            np.max(np.abs(seg))  # 絕對最大值 (對 Blink 還是很有效)
         ]
         features.append(current_feature)
     return np.array(features)
@@ -128,7 +143,6 @@ def load_all_subjects():
     if not os.path.exists(Config.DATASET_PATH): return None, None, None
     subject_folders = sorted([f.path for f in os.scandir(Config.DATASET_PATH) if f.is_dir()])
     
-    # 計算兩套切割參數的樣本數
     rf_seg_len = int(Config.RF_SEG_LEN * Config.SAMPLING_RATE)
     rf_overlap = int(rf_seg_len * Config.RF_OVERLAP)
     blk_seg_len = int(Config.BLINK_SEG_LEN * Config.SAMPLING_RATE)
@@ -152,7 +166,6 @@ def load_all_subjects():
                                 except ValueError: pass 
                     data = np.array(clean_data)
                     
-                    # 依據任務類型套用不同的切割策略
                     if task in [1, 2]:
                         segs = create_segments(data, rf_seg_len, rf_overlap, task)
                     else:
@@ -233,7 +246,7 @@ def leave_one_subject_out_validation():
 
 def plot_results(results):
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    fig.suptitle('BCI Classifier - Dynamic Segmentation Strategy', fontsize=16)
+    fig.suptitle('BCI Classifier - Complexity & Relative Power Strategy', fontsize=16)
     
     axes[0].bar(results['subject_names'], results['accuracies'], color='orange')
     axes[0].axhline(y=np.mean(results['accuracies']), color='r', linestyle='--', label=f'Mean: {np.mean(results["accuracies"]):.3f}')
