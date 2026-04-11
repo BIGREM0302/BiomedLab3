@@ -77,7 +77,7 @@ def create_segments(data, segment_length_samples, overlap_samples, task_type):
         # === 核心邏輯：依照任務進行智能過濾 ===
         if task_type == 1: # Relax
             # 放寬 Relax 的標準，多收一點資料進來訓練
-            if peak_amp > 1000: 
+            if peak_amp > 1300: 
                 start += step
                 continue 
         elif task_type == 2: # Focus
