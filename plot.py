@@ -1,20 +1,37 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy import signal
 import os
 import glob
 
-def plot_task_fixed_y(dataset_path, student_id, rounds, start_sec=8, end_sec=13, fs=512):
-    """
-    固定 Y 軸範圍並在所有子圖間共用 Y 軸
-    """
+def bandpass_filter(data, fs, low=0.1, high=45):
+    b, a = signal.butter(4, [low/(fs/2), high/(fs/2)], btype='band')
+    return signal.filtfilt(b, a, data)
+
+def notch_filter(data, fs, freq=4):
+    b, a = signal.iirnotch(freq/(fs/2), Q=10)
+    return signal.filtfilt(b, a, data)
+
+def bandstop_filter(data, fs, low=3, high=5, order=4):
+    b, a = signal.butter(
+        order,
+        [low/(fs/2), high/(fs/2)],
+        btype='bandstop'
+    )
+    return signal.filtfilt(b, a, data)
+
+
+
+def plot_task_fixed_y(dataset_path, student_id, rounds, start_sec, end_sec, fs=512):
+
     tasks = [1, 2, 3]
-    rounds = [17, 18, 19]
+    # rounds = [17, 18, 19]
     task_names = {1: "Relax", 2: "Focus", 3: "Blink"}
 
     start_idx = int(start_sec * fs)
     end_idx = int(end_sec * fs)
 
-    # === 修改 1：加入 sharey=True 讓所有圖表共用 Y 軸尺度 ===
+    
     fig, axes = plt.subplots(3, 3, figsize=(10, 6), sharex=True, sharey=True)
     fig.suptitle(f"EEG Segment (Fixed Y): {student_id}", fontsize=14)
 
@@ -27,6 +44,12 @@ def plot_task_fixed_y(dataset_path, student_id, rounds, start_sec=8, end_sec=13,
             if files:
                 try:
                     raw_data = np.loadtxt(files[0])
+                    # =============================================
+                    # ==== adding filters =========================
+                    # raw_data = bandpass_filter(raw_data, fs)
+                    # raw_data = notch_filter(raw_data, fs)
+                    # raw_data = bandstop_filter(raw_data, fs)
+                    # =============================================
                     actual_end = min(end_idx, len(raw_data))
                     data_slice = raw_data[start_idx:actual_end]
                     time = np.arange(start_idx, actual_end) / fs
@@ -35,8 +58,7 @@ def plot_task_fixed_y(dataset_path, student_id, rounds, start_sec=8, end_sec=13,
                     ax.set_title(f"{task_names[task_id]} R{round_id}", fontsize=9)
                     ax.grid(True, alpha=0.3)
                     
-                    # === 修改 2：手動固定 Y 軸顯示範圍 ===
-                    # 建議設在 -800 到 800 之間，或是根據你觀察到的最大值調整
+                    
                     ax.set_ylim(-1000, 1000) 
                     
                 except Exception as e:
@@ -45,12 +67,12 @@ def plot_task_fixed_y(dataset_path, student_id, rounds, start_sec=8, end_sec=13,
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     plt.show()
 
-# 執行指令
+
 
 if __name__ == "__main__":
-    student_id = 'b12901035'
-    rounds = [17, 18, 19]
-    start_sec = 8
-    end_sec = 16
+    student_id = 'b12901016'
+    rounds = [18, 19, 20]
+    start_sec = 10
+    end_sec = 15
 
     plot_task_fixed_y('bci_dataset_114-2', student_id, rounds, start_sec, end_sec)

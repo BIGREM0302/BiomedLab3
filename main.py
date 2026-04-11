@@ -1,4 +1,4 @@
-"""
+﻿"""
 Brain-Computer Interface MLP Classifier (BrainLink Version)
 For EEG signal relaxation/focus/blink state classification
 USE RAW DATA AS INPUT
@@ -102,15 +102,15 @@ def extract_features(segments):
     for seg in segments:
         feat = []
 
-        # === 💥 1. 暴力物理特徵 (不標準化，專門對付 Blink) === ### [MODIFIED]
-        # 直接拿濾波後、最原始的電壓來算，眨眼的數字會是其他狀態的十幾倍
+        # === ���� 1. ��游����拍����孵噩 (銝�璅�皞����嚗�撠����撠�隞� Blink) === ### [MODIFIED]
+        # ��湔�交�踵蕪瘜Ｗ�����������憪������餃��靘�蝞�嚗���函�潛����詨�������臬�嗡��������������撟曉��
         raw_ptp = np.max(seg) - np.min(seg)
         raw_var = np.var(seg)
         
-        # === 2. 逐段標準化 (為了算頻率能量，讓 Relax/Focus 站在同一起跑線) ===
+        # === 2. ���畾菜��皞���� (��箔��蝞���餌����賡��嚗�霈� Relax/Focus 蝡���典��銝�韏瑁��蝺�) ===
         seg_norm = (seg - np.mean(seg)) / (np.std(seg) + 1e-8)
 
-        # 3. 相對頻段能量 (使用標準化後的波形)
+        # 3. ��詨����餅挾��賡�� (雿輻�冽��皞����敺����瘜Ｗ耦)
         abs_powers = []
         for b in bands.values():
             bp = bandpower(seg_norm, Config.SAMPLING_RATE, b)
@@ -120,14 +120,14 @@ def extract_features(segments):
         for bp in abs_powers:
             feat.append(bp / total_power)  
 
-        # 4. 神經科學黃金指標
+        # 4. 蟡�蝬�蝘�摮賊��������璅�
         feat.append(abs_powers[2] / (abs_powers[3] + 1e-8)) # Alpha/Beta
         feat.append(abs_powers[1] / (abs_powers[3] + 1e-8)) # Theta/Beta
 
-        # 5. 組裝特徵 
-        feat.append(raw_ptp)                  # ### [MODIFIED] 塞入原始峰對峰值
-        feat.append(np.log(raw_var + 1e-8))   # ### [MODIFIED] 塞入原始變異數的 Log
-        feat.append(stats.kurtosis(seg))      # 峰度 (尖銳度)
+        # 5. 蝯�鋆���孵噩 
+        feat.append(raw_ptp)                  # ### [MODIFIED] 憛���亙��憪�撜啣��撜啣��
+        feat.append(np.log(raw_var + 1e-8))   # ### [MODIFIED] 憛���亙��憪�霈���唳�貊�� Log
+        feat.append(stats.kurtosis(seg))      # 撜啣漲 (撠���喳漲)
 
         features.append(feat)
 
@@ -225,10 +225,10 @@ def load_all_subjects():
 class EnhancedBCIClassifier:
     def __init__(self):
         self.model = MLPClassifier(
-            hidden_layer_sizes=(32, 16),  # ### [MODIFIED] 輕量化網路，防死背
+            hidden_layer_sizes=(32, 16),  # ### [MODIFIED] 頛�������蝬脰楝嚗���脫香���
             max_iter=1000,
             learning_rate_init=0.005,
-            alpha=0.1,                    # ### [MODIFIED] 增強 L2 正則化，強迫尋找泛化規律
+            alpha=0.1,                    # ### [MODIFIED] 憓�撘� L2 甇�������嚗�撘瑁翰撠���暹�����閬�敺�
             activation='relu',
             solver='adam',
             batch_size=64,
@@ -237,11 +237,11 @@ class EnhancedBCIClassifier:
             verbose=False
         )
         self.scaler = StandardScaler()
-        # 特徵已經精煉過，直接全拿
+        # ��孵噩撌脩��蝎曄�����嚗���湔�亙�冽��
         self.feature_selector = SelectKBest(f_classif, k='all') 
 
     def fit(self, X, y):
-        # === 💥 [MODIFIED] 取消所有手動門檻，讓 MLP 學習全部 3 個類別 ===
+        # === ���� [MODIFIED] ���瘨����������������瑼鳴��霈� MLP 摮貊����券�� 3 ���憿���� ===
         X_scaled = self.scaler.fit_transform(X)
         self.model.fit(X_scaled, y)
         return self
@@ -250,10 +250,10 @@ class EnhancedBCIClassifier:
         X_scaled = self.scaler.transform(X)
         probs = self.model.predict_proba(X_scaled)
         
-        # 多分類標準作法：取機率最大的類別
+        # 憭����憿�璅�皞�雿�瘜�嚗����璈�������憭抒��憿����
         raw_predictions = np.argmax(probs, axis=1)
         
-        # 加上時間多數決平滑化
+        # ���銝�������憭���豢捱撟單�����
         if smoothing_window > 1:
             raw_predictions = median_filter(raw_predictions, size=smoothing_window)
 
@@ -351,7 +351,7 @@ def main():
     std_accuracy = np.std(results['accuracies'])
     
     print("\n" + "="*40)
-    print(f"Overall Mean Accuracy: {mean_accuracy:.3f} ± {std_accuracy:.3f}")
+    print(f"Overall Mean Accuracy: {mean_accuracy:.3f} 簣 {std_accuracy:.3f}")
     
     total_cm = np.sum(results['confusion_matrices'], axis=0)
     with np.errstate(divide='ignore', invalid='ignore'):
