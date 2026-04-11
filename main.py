@@ -204,10 +204,18 @@ def load_all_subjects():
 class EnhancedBCIClassifier:
     def __init__(self):
         self.model = MLPClassifier(
-            hidden_layer_sizes=Config.HIDDEN_LAYERS, max_iter=Config.MAX_ITER,
-            learning_rate_init=Config.LEARNING_RATE, alpha=Config.ALPHA,
-            activation=Config.ACTIVATION, solver=Config.SOLVER, batch_size=Config.BATCH_SIZE,
-            early_stopping=Config.EARLY_STOPPING, random_state=Config.RANDOM_STATE
+            hidden_layer_sizes=Config.HIDDEN_LAYERS, 
+            max_iter=Config.MAX_ITER,
+            learning_rate_init=Config.LEARNING_RATE, 
+            alpha=Config.ALPHA,
+            activation=Config.ACTIVATION, 
+            solver=Config.SOLVER, 
+            batch_size=Config.BATCH_SIZE,
+            early_stopping=Config.EARLY_STOPPING, 
+            validation_fraction=Config.VALIDATION_FRACTION,
+            n_iter_no_change=Config.N_ITER_NO_CHANGE,
+            random_state=Config.RANDOM_STATE,
+            verbose=False
         )
         self.scaler = StandardScaler()
         self.feature_selector = SelectKBest(f_classif, k=Config.N_FEATURES_SELECT) if Config.FEATURE_SELECTION else None
