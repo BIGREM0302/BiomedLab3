@@ -26,7 +26,8 @@ class Config:
     RF_SEG_LEN = 4.0                   # 窗口大一點，頻譜解析度才高
     RF_OVERLAP = 0.7                   # 重疊率高一點，資料量才多
     # 【關鍵修改 1】嚴格過濾！真正的腦波不會超過 800，超過的都是肌肉或眼動雜訊，直接丟棄！
-    RF_MAX_THRES = 800                 
+    F_MAX_THRES = 1500                 
+    R_MAX_THRES = 1200
 
     # === 策略 B：針對瞬間狀態 (Blink) ===
     BLINK_SEG_LEN = 1.5                # 窗口縮小，聚焦眨眼瞬間，避免被背景稀釋
@@ -79,11 +80,11 @@ def create_segments(data, segment_length_samples, overlap_samples, task_type):
         # === 核心邏輯：依照任務進行智能過濾 ===
         if task_type == 1: # Relax
             # 放寬 Relax 的標準，多收一點資料進來訓練
-            if peak_amp > 1500: 
+            if peak_amp > Config.R_MAX_THRES: 
                 start += step
                 continue 
         elif task_type == 2: # Focus
-            if peak_amp > Config.RF_MAX_THRES:
+            if peak_amp > Config.F_MAX_THRES:
                 start += step
                 continue
                 
@@ -240,7 +241,7 @@ class EnhancedBCIClassifier:
         # 2. 客製化門檻邏輯
         for i in range(len(X)):
             # 只要 Relax 的機率超過 0.35 (不用等到 0.5 或最高)，就判定為 Relax
-            if probs[i, 0] > 0.37:  
+            if probs[i, 0] > 0.3:  
                 predictions[i] = 0
             else:
                 # 剩下的再讓 Focus 和 Blink 去比誰機率高
