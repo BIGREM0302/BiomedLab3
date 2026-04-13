@@ -1,6 +1,6 @@
 ﻿"""
-Brain-Computer Interface MLP Classifier
-FINAL VERSION: DYNAMIC SEGMENTATION + HJORTH COMPLEXITY & RELATIVE POWER
+Brain-Computer Interface MLP Classifier (Final Version)
+For EEG signal relaxation/focus/blink state classification
 """
 
 import numpy as np
