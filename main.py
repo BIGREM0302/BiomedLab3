@@ -20,24 +20,25 @@ warnings.filterwarnings('ignore')
 # Parameter Settings
 class Config:
     DATASET_PATH = "bci_dataset_114-2"
-    SKIP_SECONDS = 2.0                 # 捨棄每回合開頭前 2 秒
+
+    # ==========================================
+    # === STUDENT PREPROCESSING HERE (START) ===
+    # ==========================================
+
+    SKIP_SECONDS = 2.0                 
     
-    # === 策略 A：針對連續狀態 (Relax / Focus) ===
-    RF_SEG_LEN = 4.0                   # 窗口大一點，頻譜解析度才高
-    RF_OVERLAP = 0.7                   # 重疊率高一點，資料量才多
-    # 【關鍵修改 1】嚴格過濾！真正的腦波不會超過 800，超過的都是肌肉或眼動雜訊，直接丟棄！
+    RF_SEG_LEN = 4.0                  
+    RF_OVERLAP = 0.7                  
     RF_MAX_THRES = 800                 
     
-    # === 策略 B：針對瞬間狀態 (Blink) ===
-    BLINK_SEG_LEN = 1.5                # 窗口縮小，聚焦眨眼瞬間，避免被背景稀釋
-    BLINK_OVERLAP = 0.0                # 重疊率 0，不重複計算同一個眨眼
-    BLINK_MIN_THRES = 500              # 必須有大於 500 的突波才承認是眨眼
+    BLINK_SEG_LEN = 1.5               
+    BLINK_OVERLAP = 0.0              
+    BLINK_MIN_THRES = 500             
     
-    # MLP model parameters
     HIDDEN_LAYERS = (64, 32)           
     MAX_ITER = 200                     
     LEARNING_RATE = 0.005              
-    ALPHA = 0.05                       # 提高正規化強度，防止模型死背特徵
+    ALPHA = 0.05                       
     ACTIVATION = 'relu'                
     SOLVER = 'adam'                    
     BATCH_SIZE = 128                   
@@ -46,11 +47,21 @@ class Config:
     N_ITER_NO_CHANGE = 15
     SAMPLING_RATE = 512                
     FEATURE_SELECTION = False
-    N_FEATURES_SELECT = 10             # 精簡為 10 個最強比例與複雜度特徵
+    N_FEATURES_SELECT = 10             
     RANDOM_STATE = 42
 
+    # ==========================================
+    # ==== STUDENT PREPROCESSING HERE (END) ====
+    # ==========================================
+
 def create_segments(data, segment_length_samples, overlap_samples, task_type):
-    """根據不同任務類型，執行不同的切割與過濾策略"""
+
+    # ==========================================
+    # === STUDENT PREPROCESSING HERE (START) ===
+    # ==========================================
+
+    """Different segmentation stratergies based on the type of tasks"""
+
     skip_samples = int(Config.SKIP_SECONDS * Config.SAMPLING_RATE)
     if len(data) > skip_samples:
         data = data[skip_samples:]
@@ -74,9 +85,7 @@ def create_segments(data, segment_length_samples, overlap_samples, task_type):
         
         peak_amp = np.max(np.abs(segment_filtered))
         
-        # === 核心邏輯：依照任務進行智能過濾 ===
         if task_type == 1: # Relax
-            # 放寬 Relax 的標準，多收一點資料進來訓練
             if peak_amp > 1500: 
                 start += step
                 continue 
@@ -86,22 +95,29 @@ def create_segments(data, segment_length_samples, overlap_samples, task_type):
                 continue
                 
         elif task_type == 3:    # Blink
-            # 如果這個小視窗內沒有出現足夠大的突波，代表它切到了「沒眨眼」的空白期
             if peak_amp < Config.BLINK_MIN_THRES:
                 start += step
-                continue # 沒有眨眼的片段直接丟棄，防止標籤污染
+                continue 
             
         segments.append(segment_filtered)
         start += step
         
+    # ==========================================
+    # ==== STUDENT PREPROCESSING HERE (END) ====
+    # ==========================================
+
     return segments
 
 def extract_features(segments):
-    """【關鍵修改 2】全面改用「相對比例」與「波形複雜度 (Hjorth)」"""
+    
+    # ==========================================
+    # === STUDENT PREPROCESSING HERE (START) ===
+    # ==========================================
+
     features = []
     for seg in segments:
+
         # 1. Hjorth Parameters (Activity, Mobility, Complexity)
-        # 這是對抗單通道雜訊最強的時域特徵，完全不受絕對振幅影響
         activity = np.var(seg) + 1e-7
         diff1 = np.diff(seg)
         diff2 = np.diff(diff1)
@@ -112,7 +128,7 @@ def extract_features(segments):
         mobility = np.sqrt(var_diff1 / activity)
         complexity = np.sqrt(var_diff2 / var_diff1) / mobility
         
-        # 2. 頻域相對能量 (Relative Power)
+        # 2. Relative Band Power
         nperseg = min(len(seg), int(Config.SAMPLING_RATE * 1.0)) 
         freqs, psd = signal.welch(seg, fs=Config.SAMPLING_RATE, nperseg=nperseg)
         
@@ -121,27 +137,29 @@ def extract_features(segments):
         beta  = np.sum(psd[(freqs >= 13) & (freqs < 30)])
         total_power = theta + alpha + beta + 1e-9
         
-        # 轉換為百分比 (0~1 之間)，消除個體電壓大小差異
         rel_theta = theta / total_power
         rel_alpha = alpha / total_power
         rel_beta  = beta / total_power
         
-        # 專注/放鬆黃金比例
         beta_alpha_ratio = np.log10((beta / (alpha + 1e-9)) + 1)
         
-        # 3. 輔助特徵 (主要為了完美保留 Blink 的高辨識度)
+        # 3. Identifying Blink-specific features
         kurt = kurtosis(seg)
-        p2p_norm = np.ptp(seg) / (np.std(seg) + 1e-7) # 波峰因數 (Crest Factor)
+        p2p_norm = np.ptp(seg) / (np.std(seg) + 1e-7) 
         
         current_feature = [
             mobility, complexity, 
             rel_theta, rel_alpha, rel_beta, beta_alpha_ratio,
             kurt, p2p_norm,
-            np.log10(activity),  # 總能量取對數
-            np.max(np.abs(seg))  # 絕對最大值 (對 Blink 還是很有效)
+            np.log10(activity),  
+            np.max(np.abs(seg)) 
         ]
         features.append(current_feature)
     return np.array(features)
+
+    # ==========================================
+    # ==== STUDENT PREPROCESSING HERE (END) ====
+    # ==========================================
 
 def load_all_subjects():
     all_features, all_labels, all_subjects = [], [], []
@@ -229,26 +247,34 @@ class EnhancedBCIClassifier:
     def predict(self, X):
         X_scaled = self.scaler.transform(X)
         X_selected = self.feature_selector.transform(X_scaled) if self.feature_selector else X_scaled
+
+        # ===========================================
+        # === STUDENT POSTPROCESSING HERE (START) ===
+        # ===========================================
+
         
-        # 1. 取得三個類別的機率 [Relax(0), Focus(1), Blink(2)]
+        # 1. Obtaing Probabilities [Relax(0), Focus(1), Blink(2)]
         probs = self.model.predict_proba(X_selected)
         
         predictions = np.zeros(len(X), dtype=int)
         
-        # 2. 客製化門檻邏輯
+        # 2. Custom Probability Threshold
         for i in range(len(X)):
-            # 只要 Relax 的機率超過 0.35 (不用等到 0.5 或最高)，就判定為 Relax
             if probs[i, 0] > 0.37:  
                 predictions[i] = 0
             else:
-                # 剩下的再讓 Focus 和 Blink 去比誰機率高
-                # np.argmax(probs[i, 1:]) 會回傳 0(對應Focus) 或 1(對應Blink)，所以要 +1
+
                 predictions[i] = np.argmax(probs[i, 1:]) + 1
                 
-        # 3. 平滑化
+        # 3. Temporal Smoothing
         if len(predictions) > 5:
             return signal.medfilt(predictions, kernel_size=11) 
+       
         return predictions
+
+        # ==========================================
+        # === STUDENT POSTPROCESSING HERE (END) ===
+        # ==========================================
 
 def leave_one_subject_out_validation():
     print("\nStarting Leave-One-Subject-Out (LOSO) Cross-Validation...")
